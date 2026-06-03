@@ -26,29 +26,33 @@ async function solicitar(req, res) {
   if (centro_origem_id === centro_destino_id) return res.status(400).json({ erro: 'Centro de origem e destino devem ser diferentes' })
   if (Number(quantidade) <= 0) return res.status(400).json({ erro: 'Quantidade deve ser maior que zero' })
 
-  const { data: produto } = await supabase.from('produtos').select('tipo, unidade, unidade_insumo, fator_conversao').eq('id', produto_id).single()
+  const { data: produto } = await supabase
+    .from('produtos').select('tipo, nome, unidade, unidade_insumo, fator_conversao').eq('id', produto_id).single()
+
   if (produto?.tipo === 'ambos' && !finalidade) {
     return res.status(400).json({ erro: 'Para produtos do tipo ambos, informe a finalidade: revenda ou materia_prima' })
   }
 
-  // Busca saldo — se não tiver posição, saldo é 0 (não bloqueia, deixa a aprovação verificar)
   const { data: posicao } = await supabase
     .from('posicoes_estoque').select('quantidade')
     .eq('produto_id', produto_id).eq('centro_id', centro_origem_id).single()
-  const saldo = posicao?.quantidade || 0
 
-  if (saldo < Number(quantidade)) {
+  const saldo = Number(posicao?.quantidade || 0)
+  const qtdSolicitada = Number(quantidade)
+
+  // Usa precisão de 4 casas decimais para evitar problema de arredondamento
+  if (Math.round(saldo * 10000) < Math.round(qtdSolicitada * 10000)) {
     return res.status(422).json({
-      erro: 'Saldo insuficiente no centro de origem',
+      erro: `Saldo insuficiente para "${produto?.nome || 'produto'}" no centro de origem. Disponivel: ${saldo} ${produto?.unidade_insumo || produto?.unidade || ''}`,
       saldo_disponivel: saldo,
-      quantidade_solicitada: Number(quantidade)
+      quantidade_solicitada: qtdSolicitada
     })
   }
 
-  let quantidade_destino = Number(quantidade)
+  let quantidade_destino = qtdSolicitada
   let unidade_destino = produto?.unidade || 'un'
   if (finalidade === 'materia_prima' && produto?.fator_conversao && produto?.unidade_insumo) {
-    quantidade_destino = Number(quantidade) * Number(produto.fator_conversao)
+    quantidade_destino = qtdSolicitada * Number(produto.fator_conversao)
     unidade_destino = produto.unidade_insumo
   }
 
@@ -57,7 +61,7 @@ async function solicitar(req, res) {
     .insert({
       produto_id, centro_origem_id, centro_destino_id,
       solicitante_id: req.usuario.id,
-      quantidade: Number(quantidade),
+      quantidade: qtdSolicitada,
       quantidade_destino, unidade_destino,
       finalidade: produto?.tipo === 'ambos' ? finalidade : null,
       observacao, status: 'pendente'
@@ -66,7 +70,7 @@ async function solicitar(req, res) {
     .single()
 
   if (error) return res.status(500).json({ erro: 'Erro ao solicitar transferencia' })
-  await registrarHistorico(req.usuario.id, 'transferencias', data.id, 'criacao', null, { produto_id, centro_origem_id, centro_destino_id, quantidade: Number(quantidade), status: 'pendente' })
+  await registrarHistorico(req.usuario.id, 'transferencias', data.id, 'criacao', null, { produto_id, centro_origem_id, centro_destino_id, quantidade: qtdSolicitada, status: 'pendente' })
   return res.status(201).json(data)
 }
 
@@ -84,7 +88,6 @@ async function resolver(req, res) {
   if (transferencia.status !== 'pendente') return res.status(409).json({ erro: 'Transferencia ja resolvida' })
 
   if (acao === 'aprovar') {
-    // Verifica se já existe movimentação de saída para esta transferência (evita dupla aprovação)
     const { data: movsExistentes } = await supabase
       .from('movimentacoes').select('id')
       .eq('documento', id).eq('tipo', 'saida')
@@ -97,11 +100,13 @@ async function resolver(req, res) {
         .eq('produto_id', transferencia.produto_id)
         .eq('centro_id', transferencia.centro_origem_id).single()
 
-      const saldoAtual = posicao?.quantidade || 0
+      const saldoAtual = Number(posicao?.quantidade || 0)
 
-      if (saldoAtual < transferencia.quantidade) {
+      // Usa precisão de 4 casas decimais para evitar problema de arredondamento
+      if (Math.round(saldoAtual * 10000) < Math.round(transferencia.quantidade * 10000)) {
+        const { data: prod } = await supabase.from('produtos').select('nome').eq('id', transferencia.produto_id).single()
         return res.status(422).json({
-          erro: 'Saldo insuficiente no momento da aprovacao',
+          erro: `Saldo insuficiente para "${prod?.nome}" no momento da aprovacao. Disponivel: ${saldoAtual}`,
           saldo_disponivel: saldoAtual,
           quantidade_necessaria: transferencia.quantidade
         })
